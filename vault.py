@@ -26,6 +26,21 @@ ITERATIONS = 100_000
 KEY_LENGTH = 32
 
 
+class VaultError(Exception):
+    """Custom exception for vault operations."""
+    pass
+
+
+class VaultIntegrityError(VaultError):
+    """Exception raised when vault data is corrupted or tampered."""
+    pass
+
+
+class VaultAuthError(VaultError):
+    """Exception raised when authentication fails."""
+    pass
+
+
 def derive_key(password: str, salt: bytes) -> bytes:
     """Derive a 256-bit encryption key from password using PBKDF2-HMAC-SHA256."""
     kdf = PBKDF2HMAC(
@@ -54,13 +69,30 @@ def encrypt_data(plaintext: str, password: str) -> str:
 
 def decrypt_data(encrypted_package: str, password: str) -> str:
     """Decrypt a base64-encoded ciphertext package and return plaintext string."""
-    package = json.loads(encrypted_package)
-    salt = base64.b64decode(package["salt"])
-    nonce = base64.b64decode(package["nonce"])
-    ciphertext = base64.b64decode(package["data"])
+    try:
+        package = json.loads(encrypted_package)
+    except json.JSONDecodeError as e:
+        raise VaultIntegrityError(f"Invalid vault file format: {e}")
+
+    required_keys = {"salt", "nonce", "data"}
+    if not required_keys.issubset(package.keys()):
+        raise VaultIntegrityError("Vault file is missing required fields")
+
+    try:
+        salt = base64.b64decode(package["salt"])
+        nonce = base64.b64decode(package["nonce"])
+        ciphertext = base64.b64decode(package["data"])
+    except Exception as e:
+        raise VaultIntegrityError(f"Failed to decode vault data: {e}")
+
     key = derive_key(password, salt)
     aesgcm = AESGCM(key)
-    plaintext = aesgcm.decrypt(nonce, ciphertext, None)
+
+    try:
+        plaintext = aesgcm.decrypt(nonce, ciphertext, None)
+    except Exception:
+        raise VaultAuthError("Authentication failed: incorrect password")
+
     return plaintext.decode()
 
 
@@ -69,11 +101,19 @@ def load_vault(password: str) -> dict:
     if not VAULT_FILE.exists():
         return {}
     encrypted = VAULT_FILE.read_text().strip()
+    if not encrypted:
+        return {}
     try:
         decrypted = decrypt_data(encrypted, password)
         return json.loads(decrypted)
-    except Exception:
-        print("Error: Failed to decrypt vault. Wrong password?", file=sys.stderr)
+    except VaultAuthError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except VaultIntegrityError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        print(f"Error: Vault data is corrupted: {e}", file=sys.stderr)
         sys.exit(1)
 
 
@@ -82,18 +122,47 @@ def save_vault(vault: dict, password: str) -> None:
     plaintext = json.dumps(vault, indent=2)
     encrypted = encrypt_data(plaintext, password)
     VAULT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    VAULT_FILE.write_text(encrypted)
+
+    temp_file = VAULT_FILE.with_suffix(".tmp")
+    try:
+        temp_file.write_text(encrypted)
+        temp_file.replace(VAULT_FILE)
+    except OSError as e:
+        temp_file.unlink(missing_ok=True)
+        raise VaultError(f"Failed to save vault: {e}")
 
 
 def get_password(prompt: str = "Vault password", confirm: bool = False) -> str:
     """Prompt user for vault password securely."""
-    password = getpass.getpass(f"{prompt}: ")
+    try:
+        password = getpass.getpass(f"{prompt}: ")
+    except (EOFError, KeyboardInterrupt):
+        print("\nAborted.", file=sys.stderr)
+        sys.exit(1)
+
+    if not password:
+        print("Error: Password cannot be empty.", file=sys.stderr)
+        sys.exit(1)
+
     if confirm:
-        confirm_pw = getpass.getpass(f"Confirm {prompt}: ")
+        try:
+            confirm_pw = getpass.getpass(f"Confirm {prompt}: ")
+        except (EOFError, KeyboardInterrupt):
+            print("\nAborted.", file=sys.stderr)
+            sys.exit(1)
         if password != confirm_pw:
             print("Error: Passwords do not match.", file=sys.stderr)
             sys.exit(1)
     return password
+
+
+def validate_key(key: str) -> str:
+    """Validate a secret key name."""
+    if not key:
+        raise ValueError("Key name cannot be empty")
+    if not key.replace("_", "").replace("-", "").isalnum():
+        raise ValueError(f"Invalid key name '{key}': use only alphanumeric characters, hyphens, and underscores")
+    return key
 
 
 def cmd_init(args):
@@ -111,7 +180,15 @@ def cmd_set(args):
     password = get_password()
     vault = load_vault(password)
     key = args.key
+    try:
+        validate_key(key)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
     value = args.value if args.value else getpass.getpass(f"Value for '{key}': ")
+    if not value:
+        print("Error: Value cannot be empty.", file=sys.stderr)
+        sys.exit(1)
     vault[key] = value
     save_vault(vault, password)
     print(f"Secret '{key}' stored successfully.")
@@ -185,6 +262,8 @@ def cmd_import(args):
     content = filepath.read_text().strip()
     try:
         imported = json.loads(content)
+        if not isinstance(imported, dict):
+            raise ValueError("JSON must be an object")
     except json.JSONDecodeError:
         imported = {}
         for line in content.splitlines():
@@ -193,8 +272,17 @@ def cmd_import(args):
                 continue
             k, v = line.split("=", 1)
             imported[k.strip()] = v.strip()
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
     count = 0
     for k, v in imported.items():
+        try:
+            validate_key(k)
+        except ValueError as e:
+            print(f"Warning: Skipping invalid key '{k}': {e}", file=sys.stderr)
+            continue
         vault[k] = v
         count += 1
     save_vault(vault, password)
@@ -208,6 +296,20 @@ def cmd_change_password(args):
     new_password = get_password("New vault password", confirm=True)
     save_vault(vault, new_password)
     print("Vault password changed successfully.")
+
+
+def cmd_search(args):
+    """Search for secrets by key name pattern."""
+    password = get_password()
+    vault = load_vault(password)
+    pattern = args.pattern.lower()
+    matches = {k: v for k, v in vault.items() if pattern in k.lower()}
+    if not matches:
+        print(f"No secrets matching '{pattern}'.")
+        return
+    print(f"Matching secrets ({len(matches)}):")
+    for key in sorted(matches.keys()):
+        print(f"  - {key}")
 
 
 def main():
@@ -238,6 +340,10 @@ def main():
     p_list = subparsers.add_parser("list", aliases=["ls"], help="List all secrets")
     p_list.set_defaults(func=cmd_list)
 
+    p_search = subparsers.add_parser("search", help="Search for secrets by key pattern")
+    p_search.add_argument("pattern", help="Search pattern (substring match)")
+    p_search.set_defaults(func=cmd_search)
+
     p_export = subparsers.add_parser("export", help="Export secrets")
     p_export.add_argument("-f", "--format", choices=["json", "env", "json-export"], default="env")
     p_export.set_defaults(func=cmd_export)
@@ -255,7 +361,14 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-    args.func(args)
+    try:
+        args.func(args)
+    except VaultError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\nAborted.", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
